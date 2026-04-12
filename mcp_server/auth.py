@@ -143,3 +143,33 @@ class TokenStore:
         expired = [k for k, v in self._codes.items() if now > v.expires]
         for k in expired:
             del self._codes[k]
+
+
+# ---------------------------------------------------------------------------
+# Client Store (RFC 7591 dynamic registration)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class OAuthClient:
+    client_id: str
+    redirect_uris: list[str]
+    client_name: str = ""
+    issued_at: float = field(default_factory=time.time)
+
+
+class ClientStore:
+    def __init__(self):
+        self._clients: dict[str, OAuthClient] = {}
+
+    def register(self, redirect_uris: list[str], client_name: str = "") -> OAuthClient:
+        client_id = secrets.token_urlsafe(16)
+        client = OAuthClient(
+            client_id=client_id,
+            redirect_uris=redirect_uris,
+            client_name=client_name,
+        )
+        self._clients[client_id] = client
+        return client
+
+    def get(self, client_id: str) -> Optional[OAuthClient]:
+        return self._clients.get(client_id)

@@ -13,9 +13,13 @@ from mcp_server.auth import (
     SingleUserProvider,
     StaticPasswordProvider,
     TokenStore,
+    ClientStore,
     verify_pkce,
 )
 from mcp_server.app import create_app
+
+
+REDIRECT_URI = "https://claude.ai/callback"
 
 
 # ---------------------------------------------------------------------------
@@ -54,7 +58,7 @@ def test_token_store_full_flow():
 
     code = store.create_code(
         challenge=challenge,
-        redirect_uri="https://claude.ai/callback",
+        redirect_uri=REDIRECT_URI,
         state="xyz",
         sub="test-user",
     )
@@ -75,7 +79,7 @@ def test_token_store_invalid_token():
 def test_token_store_revoke():
     store = TokenStore()
     verifier, challenge = make_pkce_pair()
-    code = store.create_code(challenge, "https://claude.ai/callback", "", "test-user")
+    code = store.create_code(challenge, REDIRECT_URI, "", "test-user")
     store.consume_code(code)  # consume so we can issue token
 
     token = store.create_token("user")
@@ -86,6 +90,26 @@ def test_token_store_revoke():
 
 
 # ---------------------------------------------------------------------------
+# ClientStore Unit Tests
+# ---------------------------------------------------------------------------
+
+def test_client_store_register_and_get():
+    cs = ClientStore()
+    client = cs.register(redirect_uris=[REDIRECT_URI], client_name="test")
+    assert client.client_id
+    assert client.redirect_uris == [REDIRECT_URI]
+
+    fetched = cs.get(client.client_id)
+    assert fetched is not None
+    assert fetched.client_id == client.client_id
+
+
+def test_client_store_unknown_id():
+    cs = ClientStore()
+    assert cs.get("nonexistent") is None
+
+
+# ---------------------------------------------------------------------------
 # Integration Tests (Full OAuth Flow)
 # ---------------------------------------------------------------------------
 
@@ -93,6 +117,16 @@ def test_token_store_revoke():
 def client():
     app = create_app(title="Test MCP")
     return TestClient(app, raise_server_exceptions=True)
+
+
+def _register_client(client) -> str:
+    """Register a client and return its client_id."""
+    resp = client.post(
+        "/register",
+        json={"redirect_uris": [REDIRECT_URI], "client_name": "test-client"},
+    )
+    assert resp.status_code == 201
+    return resp.json()["client_id"]
 
 
 def test_health(client):
@@ -107,22 +141,88 @@ def test_oauth_metadata(client):
     data = resp.json()
     assert "authorization_endpoint" in data
     assert "token_endpoint" in data
+    assert "registration_endpoint" in data
     assert "S256" in data["code_challenge_methods_supported"]
 
 
-def _full_pkce_flow(client) -> str:
-    """Helper: runs full PKCE flow, returns access token."""
-    verifier, challenge = make_pkce_pair()
-    redirect_uri = "https://claude.ai/callback"
+def test_protected_resource_metadata(client):
+    resp = client.get("/.well-known/oauth-protected-resource")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "resource" in data
+    assert "authorization_servers" in data
+    assert len(data["authorization_servers"]) == 1
 
-    # Step 1: /authorize (SingleUserProvider -- no login needed)
+
+def test_register_client(client):
+    resp = client.post(
+        "/register",
+        json={"redirect_uris": [REDIRECT_URI], "client_name": "my-app"},
+    )
+    assert resp.status_code == 201
+    data = resp.json()
+    assert "client_id" in data
+    assert data["redirect_uris"] == [REDIRECT_URI]
+    assert data["token_endpoint_auth_method"] == "none"
+
+
+def test_register_missing_redirect_uris(client):
+    resp = client.post("/register", json={"client_name": "no-uris"})
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "invalid_client_metadata"
+
+
+def test_authorize_unknown_client(client):
+    verifier, challenge = make_pkce_pair()
     resp = client.get(
         "/authorize",
         params={
             "response_type": "code",
+            "client_id": "unknown-client-id",
             "code_challenge": challenge,
             "code_challenge_method": "S256",
-            "redirect_uri": redirect_uri,
+            "redirect_uri": REDIRECT_URI,
+            "state": "s",
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "invalid_client"
+
+
+def test_authorize_unregistered_redirect_uri(client):
+    client_id = _register_client(client)
+    verifier, challenge = make_pkce_pair()
+    resp = client.get(
+        "/authorize",
+        params={
+            "response_type": "code",
+            "client_id": client_id,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "redirect_uri": "https://attacker.example.com/callback",
+            "state": "s",
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "invalid_request"
+
+
+def _full_pkce_flow(client) -> str:
+    """Helper: runs full PKCE flow (with registration), returns access token."""
+    client_id = _register_client(client)
+    verifier, challenge = make_pkce_pair()
+
+    # Step 1: /authorize
+    resp = client.get(
+        "/authorize",
+        params={
+            "response_type": "code",
+            "client_id": client_id,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "redirect_uri": REDIRECT_URI,
             "state": "test123",
         },
         follow_redirects=False,
@@ -141,7 +241,7 @@ def _full_pkce_flow(client) -> str:
             "grant_type": "authorization_code",
             "code": code,
             "code_verifier": verifier,
-            "redirect_uri": redirect_uri,
+            "redirect_uri": REDIRECT_URI,
         },
     )
     assert resp.status_code == 200
@@ -159,6 +259,8 @@ def test_full_oauth_flow(client):
 def test_mcp_requires_bearer(client):
     resp = client.post("/mcp", json={})
     assert resp.status_code == 401
+    www_auth = resp.headers.get("www-authenticate", "")
+    assert "resource_metadata" in www_auth
 
 
 def test_mcp_with_valid_token(client):
@@ -179,14 +281,16 @@ def test_mcp_with_valid_token(client):
 
 def test_code_single_use(client):
     """Auth codes must be consumed exactly once."""
+    client_id = _register_client(client)
     verifier, challenge = make_pkce_pair()
     resp = client.get(
         "/authorize",
         params={
             "response_type": "code",
+            "client_id": client_id,
             "code_challenge": challenge,
             "code_challenge_method": "S256",
-            "redirect_uri": "https://claude.ai/callback",
+            "redirect_uri": REDIRECT_URI,
             "state": "",
         },
         follow_redirects=False,
@@ -208,17 +312,20 @@ def test_code_single_use(client):
         "code_verifier": verifier,
     })
     assert r2.status_code == 400
+    assert r2.json()["error"] == "invalid_grant"
 
 
 def test_wrong_verifier_rejected(client):
+    client_id = _register_client(client)
     _, challenge = make_pkce_pair()
     resp = client.get(
         "/authorize",
         params={
             "response_type": "code",
+            "client_id": client_id,
             "code_challenge": challenge,
             "code_challenge_method": "S256",
-            "redirect_uri": "https://claude.ai/callback",
+            "redirect_uri": REDIRECT_URI,
             "state": "",
         },
         follow_redirects=False,
@@ -231,3 +338,17 @@ def test_wrong_verifier_rejected(client):
         "code_verifier": "wrong_verifier_that_will_fail",
     })
     assert r.status_code == 400
+    assert r.json()["error"] == "invalid_grant"
+
+
+def test_token_rfc6749_error_format(client):
+    """Token endpoint errors must use RFC 6749 format, not FastAPI detail."""
+    r = client.post("/token", data={
+        "grant_type": "client_credentials",  # unsupported
+        "code": "x",
+        "code_verifier": "x",
+    })
+    assert r.status_code == 400
+    body = r.json()
+    assert "error" in body
+    assert "detail" not in body

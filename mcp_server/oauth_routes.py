@@ -3,16 +3,19 @@ OAuth 2.1 Authorization Server routes.
 
 Mounts at root level. Provides:
   GET  /.well-known/oauth-authorization-server
+  GET  /.well-known/oauth-protected-resource  (RFC 9728)
+  POST /register                               (RFC 7591)
   GET  /authorize
   POST /token
-  POST /revoke   (optional, RFC 7009)
+  POST /revoke                                 (RFC 7009)
 """
 
 import logging
+import time
 from fastapi import APIRouter, Form, HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 
-from .auth import AuthProvider, TokenStore, verify_pkce
+from .auth import AuthProvider, ClientStore, TokenStore, verify_pkce
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +24,7 @@ SUPPORTED_METHODS = ["S256"]
 
 def make_oauth_router(
     store: TokenStore,
+    client_store: ClientStore,
     provider: AuthProvider,
     base_url: str,          # e.g. "https://my-service.run.app"
     scopes_supported: list[str] | None = None,
@@ -29,7 +33,19 @@ def make_oauth_router(
     scopes = scopes_supported or ["mcp:tools"]
 
     # -----------------------------------------------------------------------
-    # Discovery (RFC 8414)
+    # Protected Resource Metadata (RFC 9728)
+    # Tells claude.ai which AS governs this MCP resource.
+    # -----------------------------------------------------------------------
+
+    @router.get("/.well-known/oauth-protected-resource")
+    def protected_resource_metadata():
+        return {
+            "resource": base_url,
+            "authorization_servers": [base_url],
+        }
+
+    # -----------------------------------------------------------------------
+    # Authorization Server Discovery (RFC 8414)
     # -----------------------------------------------------------------------
 
     @router.get("/.well-known/oauth-authorization-server")
@@ -39,12 +55,43 @@ def make_oauth_router(
             "authorization_endpoint": f"{base_url}/authorize",
             "token_endpoint": f"{base_url}/token",
             "revocation_endpoint": f"{base_url}/revoke",
+            "registration_endpoint": f"{base_url}/register",
             "code_challenge_methods_supported": SUPPORTED_METHODS,
             "response_types_supported": ["code"],
             "grant_types_supported": ["authorization_code"],
             "token_endpoint_auth_methods_supported": ["none"],
             "scopes_supported": scopes,
         }
+
+    # -----------------------------------------------------------------------
+    # Dynamic Client Registration (RFC 7591)
+    # claude.ai registers itself before the first authorize request.
+    # We accept any registration and issue a client_id; redirect_uri is
+    # stored and validated in /authorize.
+    # -----------------------------------------------------------------------
+
+    @router.post("/register", status_code=201)
+    async def register(request: Request):
+        body = await request.json()
+        redirect_uris = body.get("redirect_uris", [])
+        if not redirect_uris:
+            return JSONResponse(
+                {"error": "invalid_client_metadata", "error_description": "redirect_uris required"},
+                status_code=400,
+            )
+        client = client_store.register(
+            redirect_uris=redirect_uris,
+            client_name=body.get("client_name", ""),
+        )
+        return JSONResponse({
+            "client_id": client.client_id,
+            "client_id_issued_at": int(client.issued_at),
+            "redirect_uris": client.redirect_uris,
+            "client_name": client.client_name,
+            "token_endpoint_auth_method": "none",
+            "grant_types": ["authorization_code"],
+            "response_types": ["code"],
+        }, status_code=201)
 
     # -----------------------------------------------------------------------
     # Authorization Endpoint
@@ -54,6 +101,7 @@ def make_oauth_router(
     def authorize(
         request: Request,
         response_type: str = "code",
+        client_id: str = "",
         code_challenge: str = "",
         code_challenge_method: str = "S256",
         redirect_uri: str = "",
@@ -68,6 +116,17 @@ def make_oauth_router(
             raise HTTPException(400, "invalid_request: code_challenge required")
         if not redirect_uri:
             raise HTTPException(400, "invalid_request: redirect_uri required")
+
+        # Validate client and redirect_uri against registration
+        if client_id:
+            client = client_store.get(client_id)
+            if client is None:
+                return JSONResponse({"error": "invalid_client"}, status_code=400)
+            if redirect_uri not in client.redirect_uris:
+                return JSONResponse(
+                    {"error": "invalid_request", "error_description": "redirect_uri not registered for this client"},
+                    status_code=400,
+                )
 
         sub = provider.authenticate(request)
         if sub is None:
@@ -102,16 +161,25 @@ def make_oauth_router(
         redirect_uri: str = Form(default=""),
     ):
         if grant_type != "authorization_code":
-            raise HTTPException(400, "unsupported_grant_type")
+            return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
 
         auth_code = store.consume_code(code)
         if auth_code is None:
-            raise HTTPException(400, "invalid_grant: code expired or unknown")
+            return JSONResponse(
+                {"error": "invalid_grant", "error_description": "code expired or unknown"},
+                status_code=400,
+            )
         if not verify_pkce(code_verifier, auth_code.challenge):
-            raise HTTPException(400, "invalid_grant: PKCE verification failed")
+            return JSONResponse(
+                {"error": "invalid_grant", "error_description": "PKCE verification failed"},
+                status_code=400,
+            )
 
         if redirect_uri and redirect_uri != auth_code.redirect_uri:
-            raise HTTPException(400, "invalid_grant: redirect_uri mismatch")
+            return JSONResponse(
+                {"error": "invalid_grant", "error_description": "redirect_uri mismatch"},
+                status_code=400,
+            )
 
         access_token = store.create_token(auth_code.sub)
 

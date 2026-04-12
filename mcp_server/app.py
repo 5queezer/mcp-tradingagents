@@ -27,7 +27,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 
-from .auth import SingleUserProvider, StaticPasswordProvider, TokenStore
+from .auth import ClientStore, SingleUserProvider, StaticPasswordProvider, TokenStore
 from .oauth_routes import make_oauth_router
 
 logger = logging.getLogger(__name__)
@@ -37,12 +37,15 @@ class BearerMiddleware(BaseHTTPMiddleware):
     """
     Validates Bearer tokens on /mcp/* routes.
     Passes through all other routes (OAuth endpoints, health).
+    401 responses include RFC 9728 resource_metadata so claude.ai can
+    discover the OAuth flow automatically.
     """
     PROTECTED_PREFIX = "/mcp"
 
-    def __init__(self, app, store: TokenStore):
+    def __init__(self, app, store: TokenStore, base_url: str):
         super().__init__(app)
         self._store = store
+        self._resource_metadata_url = f"{base_url}/.well-known/oauth-protected-resource"
 
     async def dispatch(self, request: Request, call_next):
         if not request.url.path.startswith(self.PROTECTED_PREFIX):
@@ -53,7 +56,7 @@ class BearerMiddleware(BaseHTTPMiddleware):
             return JSONResponse(
                 {"error": "invalid_token", "error_description": "Bearer token required"},
                 status_code=401,
-                headers={"WWW-Authenticate": "Bearer"},
+                headers={"WWW-Authenticate": f'Bearer resource_metadata="{self._resource_metadata_url}"'},
             )
 
         token_str = auth[7:]
@@ -62,7 +65,7 @@ class BearerMiddleware(BaseHTTPMiddleware):
             return JSONResponse(
                 {"error": "invalid_token", "error_description": "Token expired or unknown"},
                 status_code=401,
-                headers={"WWW-Authenticate": "Bearer"},
+                headers={"WWW-Authenticate": f'Bearer resource_metadata="{self._resource_metadata_url}"'},
             )
 
         return await call_next(request)
@@ -90,6 +93,7 @@ def create_app(
     _base_url = base_url or os.getenv("BASE_URL", "http://localhost:8080")
     _provider = provider or _default_provider()
     _store = TokenStore()
+    _client_store = ClientStore()
     _mcp = mcp or _stub_mcp()
 
     app = FastAPI(title=title, docs_url="/docs", redoc_url=None)
@@ -104,11 +108,12 @@ def create_app(
     )
 
     # 2. Bearer enforcement on /mcp/*
-    app.add_middleware(BearerMiddleware, store=_store)
+    app.add_middleware(BearerMiddleware, store=_store, base_url=_base_url)
 
     # 3. OAuth 2.1 AS routes
     oauth_router = make_oauth_router(
         store=_store,
+        client_store=_client_store,
         provider=_provider,
         base_url=_base_url,
     )
