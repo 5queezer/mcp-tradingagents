@@ -13,6 +13,7 @@ import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional
+from urllib.parse import urlparse
 
 from fastapi import Request
 
@@ -157,11 +158,25 @@ class OAuthClient:
     issued_at: float = field(default_factory=time.time)
 
 
+def _validate_redirect_uri(uri: str) -> bool:
+    """Allow https everywhere; allow http only for localhost/loopback (dev)."""
+    try:
+        parsed = urlparse(uri)
+    except Exception:
+        return False
+    if parsed.hostname in ("localhost", "127.0.0.1", "::1"):
+        return parsed.scheme in ("http", "https")
+    return parsed.scheme == "https"
+
+
 class ClientStore:
     def __init__(self):
         self._clients: dict[str, OAuthClient] = {}
 
     def register(self, redirect_uris: list[str], client_name: str = "") -> OAuthClient:
+        for uri in redirect_uris:
+            if not _validate_redirect_uri(uri):
+                raise ValueError(f"Invalid redirect_uri: {uri!r} — must be https (or http for localhost)")
         client_id = secrets.token_urlsafe(16)
         client = OAuthClient(
             client_id=client_id,

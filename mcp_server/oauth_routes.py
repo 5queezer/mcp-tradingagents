@@ -31,6 +31,7 @@ def make_oauth_router(
 ) -> APIRouter:
     router = APIRouter()
     scopes = scopes_supported or ["mcp:tools"]
+    base_url = base_url.rstrip("/")
 
     # -----------------------------------------------------------------------
     # Protected Resource Metadata (RFC 9728)
@@ -72,17 +73,29 @@ def make_oauth_router(
 
     @router.post("/register", status_code=201)
     async def register(request: Request):
-        body = await request.json()
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse(
+                {"error": "invalid_request", "error_description": "Malformed JSON body"},
+                status_code=400,
+            )
         redirect_uris = body.get("redirect_uris", [])
         if not redirect_uris:
             return JSONResponse(
                 {"error": "invalid_client_metadata", "error_description": "redirect_uris required"},
                 status_code=400,
             )
-        client = client_store.register(
-            redirect_uris=redirect_uris,
-            client_name=body.get("client_name", ""),
-        )
+        try:
+            client = client_store.register(
+                redirect_uris=redirect_uris,
+                client_name=body.get("client_name", ""),
+            )
+        except ValueError as exc:
+            return JSONResponse(
+                {"error": "invalid_redirect_uri", "error_description": str(exc)},
+                status_code=400,
+            )
         return JSONResponse({
             "client_id": client.client_id,
             "client_id_issued_at": int(client.issued_at),

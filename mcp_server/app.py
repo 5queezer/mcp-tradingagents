@@ -45,7 +45,7 @@ class BearerMiddleware(BaseHTTPMiddleware):
     def __init__(self, app, store: TokenStore, base_url: str):
         super().__init__(app)
         self._store = store
-        self._resource_metadata_url = f"{base_url}/.well-known/oauth-protected-resource"
+        self._resource_metadata_url = f"{base_url.rstrip('/')}/.well-known/oauth-protected-resource"
 
     async def dispatch(self, request: Request, call_next):
         if not request.url.path.startswith(self.PROTECTED_PREFIX):
