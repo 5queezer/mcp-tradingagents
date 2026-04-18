@@ -39,6 +39,22 @@ TA_RETRIES="${TRADINGAGENTS_LLM_MAX_RETRIES:-6}"
 
 echo "==> Deploying $SERVICE_NAME to $REGION (project: $PROJECT)"
 
+# gcloud run quirk: multiple --set-env-vars flags in the SAME invocation
+# overwrite each other (only the last one survives). To avoid that we pack
+# every variable into a single --set-env-vars call with a custom `##`
+# delimiter so values that themselves contain commas (e.g. the fallback
+# model list) stay intact.
+ENV_VARS="REDIS_URL=${REDIS_URL}"
+ENV_VARS+="##OPENROUTER_API_KEY=${OPENROUTER_API_KEY}"
+ENV_VARS+="##ADMIN_PASSWORD=${ADMIN_PASSWORD}"
+ENV_VARS+="##WORKER_SECRET=${WORKER_SECRET}"
+ENV_VARS+="##TRADINGAGENTS_LLM_PROVIDER=${TA_LLM_PROVIDER}"
+ENV_VARS+="##TRADINGAGENTS_DEEP_THINK_LLM=${TA_DEEP}"
+ENV_VARS+="##TRADINGAGENTS_QUICK_THINK_LLM=${TA_QUICK}"
+ENV_VARS+="##TRADINGAGENTS_FALLBACK_MODELS=${TA_FALLBACK}"
+ENV_VARS+="##TRADINGAGENTS_MAX_DEBATE_ROUNDS=${TA_ROUNDS}"
+ENV_VARS+="##TRADINGAGENTS_LLM_MAX_RETRIES=${TA_RETRIES}"
+
 # First pass: deploy without BASE_URL so we learn the service URL.
 gcloud run deploy "$SERVICE_NAME" \
   --source . \
@@ -52,31 +68,24 @@ gcloud run deploy "$SERVICE_NAME" \
   --max-instances 5 \
   --timeout 3600 \
   --no-cpu-throttling \
-  --set-env-vars "OPENROUTER_API_KEY=${OPENROUTER_API_KEY}" \
-  --set-env-vars "REDIS_URL=${REDIS_URL}" \
-  --set-env-vars "ADMIN_PASSWORD=${ADMIN_PASSWORD}" \
-  --set-env-vars "WORKER_SECRET=${WORKER_SECRET}" \
-  --set-env-vars "TRADINGAGENTS_LLM_PROVIDER=${TA_LLM_PROVIDER}" \
-  --set-env-vars "TRADINGAGENTS_DEEP_THINK_LLM=${TA_DEEP}" \
-  --set-env-vars "TRADINGAGENTS_QUICK_THINK_LLM=${TA_QUICK}" \
-  --set-env-vars "^##^TRADINGAGENTS_FALLBACK_MODELS=${TA_FALLBACK}" \
-  --set-env-vars "TRADINGAGENTS_MAX_DEBATE_ROUNDS=${TA_ROUNDS}" \
-  --set-env-vars "TRADINGAGENTS_LLM_MAX_RETRIES=${TA_RETRIES}"
+  --set-env-vars "^##^${ENV_VARS}"
 
 SERVICE_URL=$(gcloud run services describe "$SERVICE_NAME" \
   --region "$REGION" --project "$PROJECT" \
   --format "value(status.url)")
 
-# Patch BASE_URL (and Cloud Tasks wiring if provided) now that we know the URL.
-PATCH_ARGS=(--set-env-vars "BASE_URL=${SERVICE_URL}")
+# Patch BASE_URL (and optional Cloud Tasks wiring). Using --update-env-vars
+# so we add to the existing set rather than replace it.
+PATCH_VARS="BASE_URL=${SERVICE_URL}"
 if [[ -n "${CLOUD_TASKS_QUEUE:-}" && -n "${CLOUD_TASKS_LOCATION:-}" ]]; then
-  PATCH_ARGS+=(--set-env-vars "CLOUD_TASKS_QUEUE=${CLOUD_TASKS_QUEUE}")
-  PATCH_ARGS+=(--set-env-vars "CLOUD_TASKS_LOCATION=${CLOUD_TASKS_LOCATION}")
-  PATCH_ARGS+=(--set-env-vars "CLOUD_TASKS_PROJECT=${PROJECT}")
+  PATCH_VARS+="##CLOUD_TASKS_QUEUE=${CLOUD_TASKS_QUEUE}"
+  PATCH_VARS+="##CLOUD_TASKS_LOCATION=${CLOUD_TASKS_LOCATION}"
+  PATCH_VARS+="##CLOUD_TASKS_PROJECT=${PROJECT}"
   if [[ -n "${CLOUD_TASKS_SERVICE_ACCOUNT:-}" ]]; then
-    PATCH_ARGS+=(--set-env-vars "CLOUD_TASKS_SERVICE_ACCOUNT=${CLOUD_TASKS_SERVICE_ACCOUNT}")
+    PATCH_VARS+="##CLOUD_TASKS_SERVICE_ACCOUNT=${CLOUD_TASKS_SERVICE_ACCOUNT}"
   fi
 fi
+PATCH_ARGS=(--update-env-vars "^##^${PATCH_VARS}")
 
 gcloud run services update "$SERVICE_NAME" \
   --region "$REGION" --project "$PROJECT" \
