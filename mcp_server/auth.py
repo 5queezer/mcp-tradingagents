@@ -78,14 +78,19 @@ class SingleUserProvider(AuthProvider):
 
 class StaticPasswordProvider(AuthProvider):
     """
-    Reads ADMIN_PASSWORD from env. Expects ?password=... query param.
-    Good for single-user deployments that want minimal friction.
+    Reads ADMIN_PASSWORD from env. Expects `password` in the query string
+    (comes in from the login form below). When the param is missing,
+    /authorize will render an HTML login form.
     """
+    needs_login_form = True
+
     def __init__(self, password: str):
         self._password = password
 
     def authenticate(self, request: Request) -> Optional[str]:
         provided = request.query_params.get("password", "")
+        if not provided:
+            return None
         if secrets.compare_digest(provided, self._password):
             return "admin"
         return None

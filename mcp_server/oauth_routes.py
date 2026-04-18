@@ -13,8 +13,10 @@ Provides:
 import logging
 from urllib.parse import parse_qs
 
+from html import escape as _h
+
 from starlette.requests import Request
-from starlette.responses import JSONResponse, RedirectResponse
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
 from starlette.routing import Route
 
 from .auth import AuthProvider, ClientStore, TokenStore, verify_pkce
@@ -118,6 +120,12 @@ def make_oauth_routes(
 
         sub = provider.authenticate(request)
         if sub is None:
+            # Providers that need an interactive login render an HTML form
+            # that posts the password back via GET so it shows up in
+            # request.query_params on the next hit.
+            if getattr(provider, "needs_login_form", False):
+                tried = "password" in params
+                return _render_login_form(params, tried=tried)
             return JSONResponse(
                 {"error": "authentication_required"},
                 status_code=401,
@@ -187,3 +195,47 @@ def make_oauth_routes(
         Route("/token", token, methods=["POST"]),
         Route("/revoke", revoke, methods=["POST"]),
     ]
+
+
+def _render_login_form(params, *, tried: bool) -> HTMLResponse:
+    """Minimal HTML login form that re-submits to /authorize as GET with all
+    OAuth params preserved as hidden fields and the password appended.
+
+    GET method keeps things simple — the provider's authenticate() can read
+    everything from request.query_params without needing to parse a form body.
+    """
+    hidden = "".join(
+        f'<input type="hidden" name="{_h(k)}" value="{_h(v)}">'
+        for k, v in params.items()
+        if k != "password"
+    )
+    error = (
+        '<p style="color:#c33;margin:0 0 12px 0">Wrong password.</p>'
+        if tried
+        else ""
+    )
+    html = f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Sign in</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  body {{ font-family: system-ui, sans-serif; background:#0b0d10; color:#eee;
+         min-height:100vh; margin:0; display:flex; align-items:center; justify-content:center; }}
+  form {{ background:#14181d; padding:28px 32px; border-radius:8px;
+          box-shadow:0 2px 20px rgba(0,0,0,.4); width:320px; }}
+  h1 {{ font-size:18px; margin:0 0 16px 0; font-weight:500; }}
+  input[type=password] {{ width:100%; box-sizing:border-box; padding:10px 12px;
+          background:#0b0d10; border:1px solid #2a3038; color:#eee; border-radius:4px;
+          font-size:14px; margin-bottom:12px; }}
+  button {{ width:100%; padding:10px; background:#4b9cff; color:white; border:none;
+          border-radius:4px; font-size:14px; cursor:pointer; }}
+  button:hover {{ background:#3b7dd6; }}
+</style></head><body>
+<form method="GET" action="/authorize" autocomplete="off">
+  <h1>Sign in to MCP server</h1>
+  {error}
+  {hidden}
+  <input type="password" name="password" placeholder="Password" autofocus required>
+  <button type="submit">Authorize</button>
+</form>
+</body></html>"""
+    return HTMLResponse(html, status_code=401 if tried else 200)
