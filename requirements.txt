@@ -4,3 +4,6 @@ fastmcp>=2.0.0
 httpx>=0.27.0
 python-multipart>=0.0.12
 starlette>=0.41.0
+redis>=5.0.0
+google-cloud-tasks>=2.16.0
+tradingagents @ git+https://github.com/5queezer/TradingAgents.git@99f62e046e5bc8f33f6b804b3055a9acca5e8143

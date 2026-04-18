@@ -43,6 +43,9 @@ def create_app(
     base_url: str | None = None,
     title: str = "MCP OAuth Server",
     instructions: str | None = None,
+    token_store=None,
+    client_store=None,
+    extra_routes=None,
 ):
     """
     App factory. Returns a Starlette app (from FastMCP) with:
@@ -59,11 +62,17 @@ def create_app(
         instructions: Text shown as the server description card in claude.ai.
                       Ignored when mcp is provided (set it on the FastMCP
                       instance directly instead).
+        token_store:  Override TokenStore. Defaults to env-driven selection —
+                      RedisTokenStore when REDIS_URL is set, in-memory otherwise.
+        client_store: Override ClientStore (same default policy).
+        extra_routes: Optional list of Starlette Route objects mounted on the
+                      app router (e.g. an internal worker endpoint). Inserted
+                      before the /mcp mount so they take precedence.
     """
     _base_url = base_url or os.getenv("BASE_URL", "http://localhost:8080")
     _provider = provider or _default_provider()
-    _store = TokenStore()
-    _client_store = ClientStore()
+    _store = token_store or _default_token_store()
+    _client_store = client_store or _default_client_store()
     _mcp = mcp or _stub_mcp(instructions=instructions)
 
     resource_metadata_url = f"{_base_url.rstrip('/')}/.well-known/oauth-protected-resource"
@@ -127,6 +136,8 @@ def create_app(
 
     for route in oauth_routes:
         app.routes.insert(0, route)
+    for route in extra_routes or []:
+        app.routes.insert(0, route)
     app.routes.insert(0, Route("/health", health, methods=["GET"]))
 
     logger.info("MCP OAuth server ready at %s", _base_url)
@@ -147,6 +158,24 @@ def _default_provider():
         "Protect /authorize at network level."
     )
     return SingleUserProvider()
+
+
+def _default_token_store():
+    url = os.getenv("REDIS_URL")
+    if url:
+        from .redis_stores import RedisTokenStore
+        logger.info("Using RedisTokenStore (REDIS_URL set)")
+        return RedisTokenStore(url)
+    logger.info("Using in-memory TokenStore")
+    return TokenStore()
+
+
+def _default_client_store():
+    url = os.getenv("REDIS_URL")
+    if url:
+        from .redis_stores import RedisClientStore
+        return RedisClientStore(url)
+    return ClientStore()
 
 
 def _stub_mcp(instructions: str | None = None):

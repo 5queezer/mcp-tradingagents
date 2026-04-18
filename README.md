@@ -1,163 +1,89 @@
-# mcp-oauth-template
+# mcp-tradingagents
 
-Generic MCP server with OAuth 2.1 PKCE for claude.ai.  
-Build any MCP service in ~30 lines. Deploy to Cloud Run in one command.
+MCP server exposing [TradingAgents](https://github.com/TauricResearch/TradingAgents) as tools, with self-contained OAuth 2.1 PKCE (via [mcp-oauth-template](https://github.com/5queezer/mcp-oauth-template)) and a Redis-backed job queue. Deploys to Cloud Run in one command.
 
----
+## Tools
 
-## Structure
+**Sync data (fast):**
+- `get_stock_data`, `get_indicators`, `get_fundamentals`
+- `get_balance_sheet`, `get_cashflow`, `get_income_statement`
+- `get_news`, `get_global_news(..., query=…)`, `get_insider_transactions`
+
+**Async full-graph analysis (3–10 min, Redis-backed):**
+- `start_analysis(ticker, date, …)` → `{job_id}`
+- `get_analysis_status(job_id)` → structured progress (phase, active_model, llm_errors, …)
+- `get_analysis_result(job_id)`
+- `list_analyses`, `cancel_analysis`, `reflect_and_remember`
+
+## Architecture
 
 ```
-mcp_server/
-  __init__.py        -- Public API
-  auth.py            -- PKCE + TokenStore + AuthProvider
-  oauth_routes.py    -- OAuth 2.1 AS endpoints
-  app.py             -- FastAPI factory (wires everything)
-
-examples/
-  polymarket_server.py  -- Concrete example (Polymarket markets)
-
-tests/
-  test_oauth.py      -- Full PKCE flow + edge cases
+claude.ai ──OAuth──▶ /authorize, /token
+          ──MCP ──▶ /mcp ──▶ sync tools             (route_to_vendor)
+                         └▶ start_analysis ──▶ Redis (job=queued)
+                                           ──▶ Cloud Tasks ──▶ /internal/run-job
+                                              (or asyncio fire-and-forget for dev)
+                         └▶ get_analysis_status     ──▶ reads Redis
 ```
 
----
+Worker (`worker.run_job`) streams LangGraph in `stream_mode="updates"`, writes progress to Redis after each node, and captures `on_llm_start` / `on_llm_error` callbacks for rate-limit visibility. TradingAgents' `FallbackChatModel` (in the upstream fork) retries with fallback models on rate-limit / API errors.
 
-## Quick Start
+## Environment
 
-### 1. Install
+Required:
+
+| var                  | purpose                                              |
+|----------------------|------------------------------------------------------|
+| `BASE_URL`           | public service URL (deploy.sh sets automatically)    |
+| `ADMIN_PASSWORD`     | OAuth login                                          |
+| `WORKER_SECRET`      | shared secret: Cloud Tasks → `/internal/run-job`     |
+| `REDIS_URL`          | `rediss://default:TOKEN@HOST:PORT` (Upstash etc.)    |
+| `OPENROUTER_API_KEY` | LLM provider                                         |
+
+Tunable:
+
+| var                               | default                    |
+|-----------------------------------|----------------------------|
+| `TRADINGAGENTS_LLM_PROVIDER`      | `openrouter`               |
+| `TRADINGAGENTS_DEEP_THINK_LLM`    | `deepseek/deepseek-chat`   |
+| `TRADINGAGENTS_QUICK_THINK_LLM`   | `deepseek/deepseek-chat`   |
+| `TRADINGAGENTS_FALLBACK_MODELS`   | elephant-alpha, glm-air, … |
+| `TRADINGAGENTS_MAX_DEBATE_ROUNDS` | `1`                        |
+| `TRADINGAGENTS_LLM_MAX_RETRIES`   | `6`                        |
+
+Cloud Tasks (optional — when set, `start_analysis` enqueues instead of running in-process):
+
+- `CLOUD_TASKS_QUEUE`, `CLOUD_TASKS_LOCATION`, `CLOUD_TASKS_PROJECT`
+- `CLOUD_TASKS_SERVICE_ACCOUNT` (for OIDC; otherwise `WORKER_SECRET` header is used)
+
+## Deploy
 
 ```bash
-pip install -r requirements.txt
+source ~/.secrets.d/openrouter
+export REDIS_URL='rediss://default:TOKEN@XXX.upstash.io:6379'
+export ADMIN_PASSWORD='…'
+export WORKER_SECRET="$(openssl rand -hex 32)"
+
+./deploy.sh tradingagents-mcp europe-west3
 ```
 
-### 2. Build your MCP server
-
-```python
-# my_service.py
-import fastmcp
-from mcp_server import create_app
-
-mcp = fastmcp.FastMCP(
-    "my-service",
-    instructions="Describe what your server does — shown as the connector card in claude.ai.",
-)
-
-@mcp.tool()
-def my_tool(query: str) -> str:
-    return f"Result for: {query}"
-
-app = create_app(mcp=mcp)
-```
-
-### 3. Run locally
-
-```bash
-uvicorn my_service:app --reload --port 8080
-```
-
-### 4. Test OAuth discovery
-
-```bash
-curl http://localhost:8080/.well-known/oauth-authorization-server | jq
-```
-
-### 5. Deploy to Cloud Run
-
-```bash
-chmod +x deploy.sh
-./deploy.sh my-service europe-west1
-```
-
-### 6. Add to claude.ai
-
-Settings → Connectors → Add MCP Server  
-URL: `https://my-service-xxxx.run.app/mcp`
-
-Claude.ai will handle the OAuth PKCE flow automatically.
-
----
-
-## Auth Modes
-
-### Single-user (default, no login)
-
-```python
-app = create_app(mcp=mcp)
-# /authorize issues code immediately -- protect at network level
-```
-
-### Single-user with password
-
-```python
-from mcp_server import create_app, StaticPasswordProvider
-import os
-
-app = create_app(
-    mcp=mcp,
-    provider=StaticPasswordProvider(os.environ["ADMIN_PASSWORD"])
-)
-```
-
-Set `ADMIN_PASSWORD` env var on Cloud Run. The `/authorize` URL will include `?password=...` which claude.ai passes through.
-
-### Multi-user (upstream OAuth)
-
-Subclass `AuthProvider`:
-
-```python
-from mcp_server.auth import AuthProvider
-from starlette.requests import Request
-
-class GoogleAuthProvider(AuthProvider):
-    def authenticate(self, request: Request) -> str | None:
-        # Check session, JWT, or upstream OAuth token
-        # Return user sub or None
-        ...
-```
-
----
-
-## OAuth 2.1 Flow (what claude.ai does)
+Claude.ai connector URL:
 
 ```
-claude.ai                    your MCP server
-   │                              │
-   │  GET /.well-known/...        │  ← Discovery
-   │──────────────────────────────▶│
-   │                              │
-   │  GET /authorize              │
-   │  ?code_challenge=<S256>      │  ← PKCE challenge
-   │──────────────────────────────▶│
-   │  302 → redirect_uri?code=X   │
-   │◀──────────────────────────────│
-   │                              │
-   │  POST /token                 │
-   │  code=X + code_verifier      │  ← PKCE verify
-   │──────────────────────────────▶│
-   │  { access_token: "..." }     │
-   │◀──────────────────────────────│
-   │                              │
-   │  POST /mcp                   │
-   │  Authorization: Bearer ...   │  ← All tool calls
-   │──────────────────────────────▶│
+https://tradingagents-mcp-<hash>.run.app/mcp
 ```
 
----
+## Files
 
-## Security Notes
-
-- `SingleUserProvider` with no password: protect `/authorize` via Cloud Run IAM or VPN if not behind a login
-- `StaticPasswordProvider`: use a strong random password, rotate via env var
-- Token store is in-memory -- tokens lost on restart; users re-auth automatically (PKCE flow is fast)
-- For production multi-user: replace `TokenStore` with a Redis or SQLite-backed implementation
-- `state` parameter is passed through but not validated in `SingleUserProvider` mode -- add validation for multi-user
-
----
-
-## Tests
-
-```bash
-pip install pytest httpx
-pytest tests/ -v
 ```
+tradingagents_server.py   FastMCP instance + tools + /internal/run-job + create_app
+worker.py                 LangGraph analysis runner + Redis progress callback
+jobs.py                   Redis helpers
+mcp_server/               mcp-oauth-template, + RedisTokenStore/ClientStore
+Dockerfile                python:3.12-slim + git + uvicorn
+deploy.sh                 gcloud run deploy wrapper
+```
+
+## License
+
+MIT (inherited from mcp-oauth-template).
